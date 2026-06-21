@@ -72,7 +72,7 @@ run_shell() {
 detect_source_dir() {
   local script_path script_dir
 
-  script_path="${BASH_SOURCE[0]}"
+  script_path="${BASH_SOURCE:-$0}"
   [ -f "$script_path" ] || return 1
 
   script_dir="$(cd -- "$(dirname -- "$script_path")" && pwd -P)"

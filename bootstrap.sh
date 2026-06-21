@@ -109,11 +109,41 @@ load_homebrew() {
   command -v brew >/dev/null 2>&1
 }
 
+is_macos() {
+  [ "$(uname -s 2>/dev/null || true)" = "Darwin" ]
+}
+
+has_admin_group() {
+  id -Gn 2>/dev/null | tr ' ' '\n' | grep -qx admin
+}
+
+require_sudo_for_homebrew() {
+  if ! is_macos; then
+    return 0
+  fi
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    log "Would validate sudo access before installing Homebrew"
+    return 0
+  fi
+
+  if ! has_admin_group; then
+    die "Homebrew install requires macOS administrator access. Add user $(id -un) to the admin group, then rerun Alep."
+  fi
+
+  log "Validating sudo access for Homebrew"
+  if ! sudo -v; then
+    die "Homebrew install requires sudo access. Confirm user $(id -un) can administer this Mac, then rerun Alep."
+  fi
+}
+
 ensure_homebrew() {
   if load_homebrew; then
     log "Homebrew is available"
     return 0
   fi
+
+  require_sudo_for_homebrew
 
   log "Installing Homebrew"
   run_shell 'NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'

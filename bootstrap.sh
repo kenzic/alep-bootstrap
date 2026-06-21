@@ -355,9 +355,20 @@ ensure_github_ssh_auth() {
 }
 
 clone_source_repo() {
-  local target
+  local target backup
 
   target="${ALEP_CHEZMOI_SOURCE:-$HOME/.local/share/chezmoi}"
+
+  if [ -d "$target/.git" ] && ! git -C "$target" rev-parse --verify HEAD >/dev/null 2>&1; then
+    backup="$target.alep-incomplete-$(date +%Y%m%d%H%M%S)"
+    log "Moving incomplete source clone to $backup"
+    run mv "$target" "$backup"
+    log "Cloning $CONFIG_REPO to $target"
+    run mkdir -p "$(dirname -- "$target")"
+    run gh repo clone "$CONFIG_REPO" "$target"
+    SOURCE_DIR="$target"
+    return 0
+  fi
 
   if [ -d "$target/.git" ]; then
     SOURCE_DIR="$(abs_dir "$target")"

@@ -8,9 +8,11 @@ PROFILE="${ALEP_PROFILE:-}"
 SOURCE_DIR=""
 CONFIG_REPO="${ALEP_CONFIG_REPO:-}"
 DRY_RUN=0
+NON_INTERACTIVE="${ALEP_NON_INTERACTIVE:-0}"
 SKIP_PRE_CHECKLIST="${ALEP_SKIP_PRE_CHECKLIST:-${ALEP_SKIP_CHECKLIST:-0}}"
 SKIP_POST_CHECKLIST="${ALEP_SKIP_POST_CHECKLIST:-${ALEP_SKIP_CHECKLIST:-0}}"
 PRE_CHECKLIST_RAN=0
+PUBLIC_PREFLIGHT_RAN=0
 
 usage() {
   cat <<'USAGE'
@@ -34,6 +36,7 @@ Environment:
   ALEP_PROFILE               Default profile when --profile is omitted.
   ALEP_CONFIG_REPO           Default private config repo when --config-repo is omitted.
   ALEP_CHEZMOI_SOURCE        Clone target for --config-repo. Defaults to ~/.local/share/chezmoi.
+  ALEP_NON_INTERACTIVE=1     Print public preflight instead of prompting.
   ALEP_SKIP_PRE_CHECKLIST=1  Skip the pre-install checklist.
   ALEP_SKIP_POST_CHECKLIST=1 Skip the post-install checklist.
   ALEP_SKIP_CHECKLIST=1      Skip both manual checklists.
@@ -74,16 +77,19 @@ run_shell() {
 }
 
 detect_source_dir() {
-  local script_path script_dir
+  local script_path script_dir candidate
 
   script_path="$0"
   [ -f "$script_path" ] || return 1
 
   script_dir="$(cd -- "$(dirname -- "$script_path")" && pwd -P)"
-  if [ -d "$script_dir/.chezmoidata" ] && [ -d "$script_dir/.chezmoiscripts" ]; then
-    printf '%s\n' "$script_dir"
-    return 0
-  fi
+  for candidate in "$script_dir" "$script_dir/.."; do
+    candidate="$(cd -- "$candidate" && pwd -P)"
+    if [ -d "$candidate/.chezmoidata" ] && [ -d "$candidate/.chezmoiscripts" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
 
   return 1
 }
@@ -175,16 +181,23 @@ ensure_bootstrap_tools() {
   ensure_formula chezmoi chezmoi
 }
 
-ensure_github_token_scopes() {
+remove_delete_repo_scope() {
+  local output
+
   if [ "$DRY_RUN" -eq 1 ]; then
-    log "Would harden GitHub CLI token scopes"
-    run gh auth refresh --hostname github.com --scopes write:public_key --remove-scopes delete_repo
+    log "Would remove delete_repo from GitHub CLI token if present"
+    run gh auth refresh --hostname github.com --remove-scopes delete_repo
     return 0
   fi
 
-  log "Hardening GitHub CLI token scopes"
-  if ! gh auth refresh --hostname github.com --scopes write:public_key --remove-scopes delete_repo; then
-    log "Warning: could not refresh GitHub CLI token scopes; SSH key upload may require manual setup"
+  output="$(gh auth status --hostname github.com 2>&1 || true)"
+  if ! printf '%s\n' "$output" | grep -Eq '(^|[^[:alnum:]_])delete_repo([^[:alnum:]_]|$)'; then
+    return 0
+  fi
+
+  log "Removing delete_repo from GitHub CLI token scopes"
+  if ! gh auth refresh --hostname github.com --remove-scopes delete_repo; then
+    log "Warning: could not remove delete_repo from GitHub CLI token scopes"
   fi
 }
 
@@ -193,14 +206,14 @@ ensure_github_auth() {
     if command -v gh >/dev/null 2>&1 && gh auth status --hostname github.com >/dev/null 2>&1; then
       log "GitHub CLI is authenticated"
       run gh auth setup-git --hostname github.com
-      ensure_github_token_scopes
+      remove_delete_repo_scope
       return 0
     fi
 
     log "Would authenticate GitHub CLI with SSH git protocol"
     run gh auth login --hostname github.com --git-protocol ssh --scopes write:public_key
     run gh auth setup-git --hostname github.com
-    ensure_github_token_scopes
+    remove_delete_repo_scope
     return 0
   fi
 
@@ -211,14 +224,14 @@ ensure_github_auth() {
   if gh auth status --hostname github.com >/dev/null 2>&1; then
     log "GitHub CLI is authenticated"
     run gh auth setup-git --hostname github.com
-    ensure_github_token_scopes
+    remove_delete_repo_scope
     return 0
   fi
 
   log "Authenticating GitHub CLI with SSH git protocol"
   run gh auth login --hostname github.com --git-protocol ssh --scopes write:public_key
   run gh auth setup-git --hostname github.com
-  ensure_github_token_scopes
+  remove_delete_repo_scope
 }
 
 github_ssh_auth_ok() {
@@ -231,43 +244,58 @@ github_ssh_auth_ok() {
   printf '%s\n' "$output" | grep -qi 'successfully authenticated'
 }
 
-ensure_local_ssh_key() {
+ensure_ssh_config_uses_key() {
+  local private="$1"
+  local config="$HOME/.ssh/config"
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    log_err "Would configure SSH to use $private for github.com"
+    return 0
+  fi
+
+  touch "$config"
+  chmod 600 "$config"
+
+  if grep -Fq "IdentityFile $private" "$config"; then
+    return 0
+  fi
+
+  {
+    printf '\n# Managed by Alep bootstrap.\n'
+    printf 'Host github.com\n'
+    printf '  AddKeysToAgent yes\n'
+    printf '  IdentityFile %s\n' "$private"
+  } >>"$config"
+}
+
+ensure_alep_ssh_key() {
   local private public comment host
 
   if [ "$DRY_RUN" -eq 1 ]; then
-    log_err "Would ensure a local SSH authentication key exists"
-    printf '%s\n' "$HOME/.ssh/id_ed25519.pub"
+    log_err "Would ensure a dedicated Alep SSH authentication key exists"
+    printf '%s\n' "$HOME/.ssh/id_ed25519_alep.pub"
     return 0
   fi
 
   mkdir -p "$HOME/.ssh"
   chmod 700 "$HOME/.ssh"
 
-  for private in "$HOME/.ssh/id_ed25519" "$HOME/.ssh/id_ecdsa" "$HOME/.ssh/id_rsa"; do
-    public="$private.pub"
-    if [ -f "$public" ] && [ -f "$private" ]; then
-      printf '%s\n' "$public"
-      return 0
-    fi
-
-    if [ -f "$private" ]; then
-      log_err "Reconstructing missing public key $public"
-      ssh-keygen -y -f "$private" >"$public"
-      chmod 644 "$public"
-      printf '%s\n' "$public"
-      return 0
-    fi
-  done
-
-  private="$HOME/.ssh/id_ed25519"
+  private="$HOME/.ssh/id_ed25519_alep"
   public="$private.pub"
   host="$(hostname -s 2>/dev/null || hostname 2>/dev/null || printf 'mac')"
   comment="alep-$(id -un)@$host"
 
-  log_err "Generating SSH key $private"
-  ssh-keygen -t ed25519 -C "$comment" -f "$private" -N ""
+  if [ -f "$private" ] && [ ! -f "$public" ]; then
+    log_err "Reconstructing missing public key $public"
+    ssh-keygen -y -f "$private" >"$public"
+  elif [ ! -f "$private" ]; then
+    log_err "Generating SSH key $private"
+    ssh-keygen -t ed25519 -C "$comment" -f "$private" -N ""
+  fi
+
   chmod 600 "$private"
-  chmod 644 "$public"
+  [ ! -f "$public" ] || chmod 644 "$public"
+  ensure_ssh_config_uses_key "$private"
   printf '%s\n' "$public"
 }
 
@@ -280,14 +308,23 @@ upload_github_ssh_key() {
 
   if [ "$DRY_RUN" -eq 1 ]; then
     log "Would upload SSH public key to GitHub"
+    run gh auth refresh --hostname github.com --scopes write:public_key --remove-scopes delete_repo
     run gh ssh-key add "$public" --title "$title"
     return 0
   fi
 
   log "Uploading SSH public key to GitHub"
-  if ! gh ssh-key add "$public" --title "$title"; then
-    log "Warning: could not upload SSH key; checking whether GitHub SSH auth works anyway"
+  if gh ssh-key add "$public" --title "$title"; then
+    return 0
   fi
+
+  log "Refreshing GitHub CLI SSH-key upload scope"
+  if gh auth refresh --hostname github.com --scopes write:public_key --remove-scopes delete_repo &&
+    gh ssh-key add "$public" --title "$title"; then
+    return 0
+  fi
+
+  log "Warning: could not upload SSH key; checking whether GitHub SSH auth works anyway"
 }
 
 ensure_github_ssh_auth() {
@@ -296,7 +333,7 @@ ensure_github_ssh_auth() {
   if [ "$DRY_RUN" -eq 1 ]; then
     log "Would verify GitHub SSH authentication"
     run ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -T git@github.com
-    public="$(ensure_local_ssh_key)"
+    public="$(ensure_alep_ssh_key)"
     upload_github_ssh_key "$public"
     return 0
   fi
@@ -306,7 +343,7 @@ ensure_github_ssh_auth() {
     return 0
   fi
 
-  public="$(ensure_local_ssh_key)"
+  public="$(ensure_alep_ssh_key)"
   upload_github_ssh_key "$public"
 
   if github_ssh_auth_ok; then
@@ -406,6 +443,12 @@ run_pre_install_checklist() {
   checklist="$SOURCE_DIR/scripts/pre-install-checklist.sh"
 
   if [ ! -f "$checklist" ]; then
+    if [ "$DRY_RUN" -eq 1 ]; then
+      log "Would run pre-install checklist after source is available: $checklist"
+      PRE_CHECKLIST_RAN=1
+      return 0
+    fi
+
     log "Pre-install checklist not found at $checklist"
     PRE_CHECKLIST_RAN=1
     return 0
@@ -419,6 +462,76 @@ run_pre_install_checklist() {
   log "Running pre-install checklist"
   run "$checklist" "${args[@]}"
   PRE_CHECKLIST_RAN=1
+}
+
+run_public_preflight_checklist() {
+  local items total index item reply completed skipped
+
+  if [ "$PUBLIC_PREFLIGHT_RAN" -eq 1 ] || [ -n "$SOURCE_DIR" ]; then
+    return 0
+  fi
+
+  if [ "$SKIP_PRE_CHECKLIST" = "1" ]; then
+    log "Skipping public preflight checklist"
+    PUBLIC_PREFLIGHT_RAN=1
+    return 0
+  fi
+
+  items=(
+    "Confirm this Mac is on trusted power and network."
+    "Confirm this macOS user is an administrator and can run: sudo -v."
+    "Keep GitHub credentials and 2FA ready for gh auth login."
+    "Confirm the GitHub account has access to $CONFIG_REPO and is not an owner/admin if deletion protection matters."
+    "Allow Alep to create or upload a GitHub SSH authentication key for this Mac."
+  )
+
+  printf '\nAlep Public Bootstrap Preflight (%s)\n' "$PROFILE"
+  printf '%s\n' '-------------------------------------'
+  index=1
+  for item in "${items[@]}"; do
+    printf '%2d. %s\n' "$index" "$item"
+    index=$((index + 1))
+  done
+
+  if [ "$DRY_RUN" -eq 1 ] || [ "$NON_INTERACTIVE" = "1" ] || [ ! -r /dev/tty ]; then
+    PUBLIC_PREFLIGHT_RAN=1
+    return 0
+  fi
+
+  total="${#items[@]}"
+  index=1
+  completed=0
+  skipped=0
+
+  printf '\nPress Enter to mark an item done, type s to skip, or q to quit.\n'
+  for item in "${items[@]}"; do
+    printf '\n[%d/%d] %s\n' "$index" "$total" "$item"
+    while true; do
+      printf 'Done? [Enter/s/q] '
+      IFS= read -r reply < /dev/tty || return 0
+      case "$reply" in
+        "")
+          completed=$((completed + 1))
+          break
+          ;;
+        s | S)
+          skipped=$((skipped + 1))
+          break
+          ;;
+        q | Q)
+          die "public preflight checklist stopped before provisioning"
+          ;;
+        *)
+          printf 'Use Enter, s, or q.\n'
+          ;;
+      esac
+    done
+
+    index=$((index + 1))
+  done
+
+  printf '\nPublic preflight complete. Completed: %d. Skipped: %d.\n' "$completed" "$skipped"
+  PUBLIC_PREFLIGHT_RAN=1
 }
 
 run_post_install_checklist() {
@@ -511,15 +624,20 @@ else
   SOURCE_DIR="$(detect_source_dir || true)"
 fi
 
+if [ -z "$SOURCE_DIR" ] && [ -z "$CONFIG_REPO" ]; then
+  die "provide --source PATH or --config-repo OWNER/REPO"
+fi
+
 if [ -n "$SOURCE_DIR" ]; then
   run_pre_install_checklist
+else
+  run_public_preflight_checklist
 fi
 
 ensure_homebrew
 ensure_bootstrap_tools
 
 if [ -z "$SOURCE_DIR" ]; then
-  [ -n "$CONFIG_REPO" ] || die "provide --source PATH or --config-repo OWNER/REPO"
   ensure_github_auth
   ensure_github_ssh_auth
   clone_source_repo

@@ -44,6 +44,10 @@ log() {
   printf '==> %s\n' "$*"
 }
 
+log_err() {
+  printf '==> %s\n' "$*" >&2
+}
+
 die() {
   printf 'error: %s\n' "$*" >&2
   exit 1
@@ -171,17 +175,32 @@ ensure_bootstrap_tools() {
   ensure_formula chezmoi chezmoi
 }
 
+ensure_github_token_scopes() {
+  if [ "$DRY_RUN" -eq 1 ]; then
+    log "Would harden GitHub CLI token scopes"
+    run gh auth refresh --hostname github.com --scopes write:public_key --remove-scopes delete_repo
+    return 0
+  fi
+
+  log "Hardening GitHub CLI token scopes"
+  if ! gh auth refresh --hostname github.com --scopes write:public_key --remove-scopes delete_repo; then
+    log "Warning: could not refresh GitHub CLI token scopes; SSH key upload may require manual setup"
+  fi
+}
+
 ensure_github_auth() {
   if [ "$DRY_RUN" -eq 1 ]; then
     if command -v gh >/dev/null 2>&1 && gh auth status --hostname github.com >/dev/null 2>&1; then
       log "GitHub CLI is authenticated"
       run gh auth setup-git --hostname github.com
+      ensure_github_token_scopes
       return 0
     fi
 
     log "Would authenticate GitHub CLI with SSH git protocol"
-    run gh auth login --hostname github.com --git-protocol ssh
+    run gh auth login --hostname github.com --git-protocol ssh --scopes write:public_key
     run gh auth setup-git --hostname github.com
+    ensure_github_token_scopes
     return 0
   fi
 
@@ -192,12 +211,110 @@ ensure_github_auth() {
   if gh auth status --hostname github.com >/dev/null 2>&1; then
     log "GitHub CLI is authenticated"
     run gh auth setup-git --hostname github.com
+    ensure_github_token_scopes
     return 0
   fi
 
   log "Authenticating GitHub CLI with SSH git protocol"
-  run gh auth login --hostname github.com --git-protocol ssh
+  run gh auth login --hostname github.com --git-protocol ssh --scopes write:public_key
   run gh auth setup-git --hostname github.com
+  ensure_github_token_scopes
+}
+
+github_ssh_auth_ok() {
+  local output
+
+  set +e
+  output="$(ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -T git@github.com 2>&1)"
+  set -e
+
+  printf '%s\n' "$output" | grep -qi 'successfully authenticated'
+}
+
+ensure_local_ssh_key() {
+  local private public comment host
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    log_err "Would ensure a local SSH authentication key exists"
+    printf '%s\n' "$HOME/.ssh/id_ed25519.pub"
+    return 0
+  fi
+
+  mkdir -p "$HOME/.ssh"
+  chmod 700 "$HOME/.ssh"
+
+  for private in "$HOME/.ssh/id_ed25519" "$HOME/.ssh/id_ecdsa" "$HOME/.ssh/id_rsa"; do
+    public="$private.pub"
+    if [ -f "$public" ] && [ -f "$private" ]; then
+      printf '%s\n' "$public"
+      return 0
+    fi
+
+    if [ -f "$private" ]; then
+      log_err "Reconstructing missing public key $public"
+      ssh-keygen -y -f "$private" >"$public"
+      chmod 644 "$public"
+      printf '%s\n' "$public"
+      return 0
+    fi
+  done
+
+  private="$HOME/.ssh/id_ed25519"
+  public="$private.pub"
+  host="$(hostname -s 2>/dev/null || hostname 2>/dev/null || printf 'mac')"
+  comment="alep-$(id -un)@$host"
+
+  log_err "Generating SSH key $private"
+  ssh-keygen -t ed25519 -C "$comment" -f "$private" -N ""
+  chmod 600 "$private"
+  chmod 644 "$public"
+  printf '%s\n' "$public"
+}
+
+upload_github_ssh_key() {
+  local public title host
+
+  public="$1"
+  host="$(hostname -s 2>/dev/null || hostname 2>/dev/null || printf 'mac')"
+  title="alep-$host-$(date +%Y%m%d%H%M%S)"
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    log "Would upload SSH public key to GitHub"
+    run gh ssh-key add "$public" --title "$title"
+    return 0
+  fi
+
+  log "Uploading SSH public key to GitHub"
+  if ! gh ssh-key add "$public" --title "$title"; then
+    log "Warning: could not upload SSH key; checking whether GitHub SSH auth works anyway"
+  fi
+}
+
+ensure_github_ssh_auth() {
+  local public
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    log "Would verify GitHub SSH authentication"
+    run ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -T git@github.com
+    public="$(ensure_local_ssh_key)"
+    upload_github_ssh_key "$public"
+    return 0
+  fi
+
+  if github_ssh_auth_ok; then
+    log "GitHub SSH authentication is working"
+    return 0
+  fi
+
+  public="$(ensure_local_ssh_key)"
+  upload_github_ssh_key "$public"
+
+  if github_ssh_auth_ok; then
+    log "GitHub SSH authentication is working"
+    return 0
+  fi
+
+  die "GitHub SSH authentication failed. Add $public to GitHub SSH keys or grant this account access to $CONFIG_REPO, then rerun Alep."
 }
 
 clone_source_repo() {
@@ -227,7 +344,9 @@ clone_source_repo() {
     return 0
   fi
 
-  if [ -e "$target" ]; then
+  if [ -d "$target" ] && [ -z "$(ls -A "$target")" ]; then
+    log "Reusing empty source target at $target"
+  elif [ -e "$target" ]; then
     die "source target exists but is not a git repo: $target"
   fi
 
@@ -402,6 +521,7 @@ ensure_bootstrap_tools
 if [ -z "$SOURCE_DIR" ]; then
   [ -n "$CONFIG_REPO" ] || die "provide --source PATH or --config-repo OWNER/REPO"
   ensure_github_auth
+  ensure_github_ssh_auth
   clone_source_repo
   run_pre_install_checklist
 fi

@@ -184,6 +184,61 @@ has_admin_group() {
   id -Gn 2>/dev/null | tr ' ' '\n' | grep -qx admin
 }
 
+is_git_repo() {
+  local target="$1"
+  local target_root git_root
+
+  [ -d "$target" ] || return 1
+  target_root="$(cd -- "$target" && pwd -P)" || return 1
+  git_root="$(git -C "$target" rev-parse --show-toplevel 2>/dev/null)" || return 1
+  git_root="$(cd -- "$git_root" && pwd -P)" || return 1
+  [ "$target_root" = "$git_root" ]
+}
+
+remote_to_slug() {
+  local remote="$1"
+
+  case "$remote" in
+    git@github.com:*.git)
+      remote="${remote#git@github.com:}"
+      printf '%s\n' "${remote%.git}"
+      ;;
+    git@github.com:*)
+      printf '%s\n' "${remote#git@github.com:}"
+      ;;
+    https://github.com/*.git)
+      remote="${remote#https://github.com/}"
+      printf '%s\n' "${remote%.git}"
+      ;;
+    https://github.com/*)
+      printf '%s\n' "${remote#https://github.com/}"
+      ;;
+    ssh://git@github.com/*.git)
+      remote="${remote#ssh://git@github.com/}"
+      printf '%s\n' "${remote%.git}"
+      ;;
+    ssh://git@github.com/*)
+      printf '%s\n' "${remote#ssh://git@github.com/}"
+      ;;
+    *)
+      printf '%s\n' "$remote"
+      ;;
+  esac
+}
+
+verify_source_repo_remote() {
+  local target="$1"
+  local remote slug
+
+  remote="$(git -C "$target" remote get-url origin 2>/dev/null || true)"
+  [ -n "$remote" ] || die "existing source clone has no origin remote: $target"
+
+  slug="$(remote_to_slug "$remote")"
+  if [ "$slug" != "$CONFIG_REPO" ]; then
+    die "existing source clone origin is $slug, expected $CONFIG_REPO: $target"
+  fi
+}
+
 require_sudo_for_homebrew() {
   if ! is_macos; then
     return 0
@@ -304,6 +359,9 @@ github_ssh_auth_ok() {
 ensure_ssh_config_uses_key() {
   local private="$1"
   local config="$HOME/.ssh/config"
+  local begin="# >>> Alep GitHub SSH >>>"
+  local end="# <<< Alep GitHub SSH <<<"
+  local tmp
 
   if [ "$DRY_RUN" -eq 1 ]; then
     log_err "Would configure SSH to use $private for github.com"
@@ -313,16 +371,21 @@ ensure_ssh_config_uses_key() {
   touch "$config"
   chmod 600 "$config"
 
-  if grep -Fq "IdentityFile $private" "$config"; then
-    return 0
-  fi
-
+  tmp="$(mktemp "${TMPDIR:-/tmp}/alep-ssh-config.XXXXXX")"
   {
-    printf '\n# Managed by Alep bootstrap.\n'
+    printf '%s\n' "$begin"
     printf 'Host github.com\n'
     printf '  AddKeysToAgent yes\n'
     printf '  IdentityFile %s\n' "$private"
-  } >>"$config"
+    printf '%s\n' "$end"
+    awk -v begin="$begin" -v end="$end" '
+      $0 == begin { skip = 1; next }
+      $0 == end { skip = 0; next }
+      !skip { print }
+    ' "$config"
+  } >"$tmp"
+  mv "$tmp" "$config"
+  chmod 600 "$config"
 }
 
 ensure_alep_ssh_key() {
@@ -416,7 +479,7 @@ clone_source_repo() {
 
   target="${ALEP_CHEZMOI_SOURCE:-$HOME/.local/share/chezmoi}"
 
-  if [ -d "$target/.git" ] && ! git -C "$target" rev-parse --verify HEAD >/dev/null 2>&1; then
+  if is_git_repo "$target" && ! git -C "$target" rev-parse --verify HEAD >/dev/null 2>&1; then
     backup="$target.alep-incomplete-$(date +%Y%m%d%H%M%S)"
     log "Moving incomplete source clone to $backup"
     run mv "$target" "$backup"
@@ -427,8 +490,9 @@ clone_source_repo() {
     return 0
   fi
 
-  if [ -d "$target/.git" ]; then
+  if is_git_repo "$target"; then
     SOURCE_DIR="$(abs_dir "$target")"
+    verify_source_repo_remote "$SOURCE_DIR"
     log "Refreshing existing source clone at $SOURCE_DIR"
     run git -C "$SOURCE_DIR" fetch --prune origin
 
@@ -535,7 +599,11 @@ run_pre_install_checklist() {
   fi
 
   log "Running pre-install checklist"
-  if ! run "$checklist" "${args[@]}"; then
+  if [ "$DRY_RUN" -eq 1 ]; then
+    if ! "$checklist" "${args[@]}"; then
+      die "pre-install checklist failed"
+    fi
+  elif ! run "$checklist" "${args[@]}"; then
     die "pre-install checklist failed"
   fi
   log "Pre-install checklist complete; continuing"
@@ -625,14 +693,21 @@ run_post_install_checklist() {
 
   checklist="$SOURCE_DIR/scripts/post-install-checklist.sh"
 
-  if [ "$DRY_RUN" -eq 1 ]; then
-    log "Would run post-install checklist"
-    run "$checklist" --profile "$PROFILE" --print-only
+  if [ ! -f "$checklist" ]; then
+    if [ "$DRY_RUN" -eq 1 ]; then
+      log "Would run post-install checklist after source is available: $checklist"
+      return 0
+    fi
+
+    log "Post-install checklist not found at $checklist"
     return 0
   fi
 
-  if [ ! -f "$checklist" ]; then
-    log "Post-install checklist not found at $checklist"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    log "Running post-install checklist"
+    if ! "$checklist" --profile "$PROFILE" --print-only; then
+      die "post-install checklist failed"
+    fi
     return 0
   fi
 

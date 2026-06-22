@@ -1,4 +1,19 @@
 #!/usr/bin/env bash
+
+if [ -z "${ALEP_BOOTSTRAP_SPOOLED:-}" ] && [ ! -f "${BASH_SOURCE[0]:-$0}" ]; then
+  alep_spooled_bootstrap="$(mktemp "${TMPDIR:-/tmp}/alep-bootstrap.XXXXXX")" || exit 1
+  cat >"$alep_spooled_bootstrap" || exit 1
+  chmod 700 "$alep_spooled_bootstrap" || exit 1
+  export ALEP_BOOTSTRAP_SPOOLED=1
+  printf '==> Re-executing piped bootstrap from %s\n' "$alep_spooled_bootstrap"
+
+  if { : < /dev/tty; } 2>/dev/null; then
+    exec /usr/bin/env bash "$alep_spooled_bootstrap" "$@" < /dev/tty
+  fi
+
+  exec /usr/bin/env bash "$alep_spooled_bootstrap" "$@" < /dev/null
+fi
+
 set -Eeuo pipefail
 
 # Public-safe Alep bootstrap. This file must not contain private repo names,

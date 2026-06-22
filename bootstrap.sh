@@ -471,7 +471,10 @@ run_pre_install_checklist() {
   fi
 
   log "Running pre-install checklist"
-  run "$checklist" "${args[@]}"
+  if ! run "$checklist" "${args[@]}"; then
+    die "pre-install checklist failed"
+  fi
+  log "Pre-install checklist complete; continuing"
   PRE_CHECKLIST_RAN=1
 }
 
@@ -519,7 +522,9 @@ run_public_preflight_checklist() {
     printf '\n[%d/%d] %s\n' "$index" "$total" "$item"
     while true; do
       printf 'Done? [Enter/s/q] '
-      IFS= read -r reply < /dev/tty || return 0
+      if ! IFS= read -r reply < /dev/tty; then
+        die "lost access to /dev/tty while running public preflight checklist"
+      fi
       case "$reply" in
         "")
           completed=$((completed + 1))
@@ -542,6 +547,7 @@ run_public_preflight_checklist() {
   done
 
   printf '\nPublic preflight complete. Completed: %d. Skipped: %d.\n' "$completed" "$skipped"
+  log "Public preflight complete; continuing"
   PUBLIC_PREFLIGHT_RAN=1
 }
 
@@ -567,7 +573,10 @@ run_post_install_checklist() {
   fi
 
   log "Running post-install checklist"
-  run "$checklist" --profile "$PROFILE"
+  if ! run "$checklist" --profile "$PROFILE"; then
+    die "post-install checklist failed"
+  fi
+  log "Post-install checklist complete"
 }
 
 while [ "$#" -gt 0 ]; do

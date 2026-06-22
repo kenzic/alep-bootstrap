@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 # Public-safe Alep bootstrap. This file must not contain private repo names,
 # tokens, hostnames, API keys, SSH keys, or machine-local secrets.
@@ -56,7 +56,25 @@ die() {
   exit 1
 }
 
+on_error() {
+  local status=$?
+  local line command
+
+  line="${BASH_LINENO[0]:-${LINENO:-unknown}}"
+  command="${BASH_COMMAND:-unknown}"
+  log_err "Bootstrap failed near line $line while running: $command"
+  exit "$status"
+}
+
+trap on_error ERR
+
+install_error_trap() {
+  trap on_error ERR
+}
+
 run() {
+  local status
+
   if [ "$DRY_RUN" -eq 1 ]; then
     printf '+'
     printf ' %q' "$@"
@@ -64,16 +82,40 @@ run() {
     return 0
   fi
 
+  trap - ERR
+  set +e
   "$@"
+  status=$?
+  set -e
+  install_error_trap
+
+  if [ "$status" -ne 0 ]; then
+    printf 'error: command failed with status %d:' "$status" >&2
+    printf ' %q' "$@" >&2
+    printf '\n' >&2
+    exit "$status"
+  fi
 }
 
 run_shell() {
+  local status
+
   if [ "$DRY_RUN" -eq 1 ]; then
     printf '+ %s\n' "$*"
     return 0
   fi
 
+  trap - ERR
+  set +e
   /bin/bash -c "$*"
+  status=$?
+  set -e
+  install_error_trap
+
+  if [ "$status" -ne 0 ]; then
+    printf 'error: shell command failed with status %d: %s\n' "$status" "$*" >&2
+    exit "$status"
+  fi
 }
 
 detect_source_dir() {
@@ -405,7 +447,7 @@ clone_source_repo() {
 }
 
 write_chezmoi_config() {
-  local config_dir config_file backup escaped_source escaped_profile
+  local config_dir config_file backup escaped_source escaped_profile tmp_file
 
   config_dir="$HOME/.config/chezmoi"
   config_file="$config_dir/chezmoi.toml"
@@ -417,25 +459,32 @@ write_chezmoi_config() {
     return 0
   fi
 
+  log "Writing chezmoi config for profile $PROFILE"
   mkdir -p "$config_dir"
 
   if [ -f "$config_file" ] && ! grep -q 'Managed by Alep bootstrap' "$config_file"; then
     backup="$config_file.alep-backup-$(date +%Y%m%d%H%M%S)"
-    cp "$config_file" "$backup"
+    if ! cp "$config_file" "$backup"; then
+      die "failed to back up existing chezmoi config: $config_file"
+    fi
     log "Backed up existing chezmoi config to $backup"
   fi
 
+  tmp_file="$(mktemp "$config_dir/chezmoi.toml.XXXXXX")"
   {
     printf '# Managed by Alep bootstrap. Edit the Alep repo data files, then rerun bootstrap.\n'
     printf 'sourceDir = "%s"\n\n' "$escaped_source"
     printf '[data]\n'
     printf 'profile = "%s"\n' "$escaped_profile"
-  } >"$config_file"
+  } >"$tmp_file"
+  mv "$tmp_file" "$config_file"
+  log "Chezmoi config written to $config_file"
 }
 
 apply_chezmoi() {
-  log "Applying Alep profile $PROFILE"
-  run chezmoi apply
+  log "Applying Alep profile $PROFILE from $SOURCE_DIR"
+  run chezmoi --source "$SOURCE_DIR" apply
+  log "Chezmoi apply complete"
 }
 
 run_pre_install_checklist() {
